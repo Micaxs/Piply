@@ -1,0 +1,134 @@
+@use '@angular/material' as mat;
+@import 'material-icons/iconfont/material-icons.css';
+
+// ── Default CSS variables (Catppuccin Mocha — overridden at runtime) ─────────
+:root {
+  --ctp-crust:    #11111b;
+  --ctp-mantle:   #181825;
+  --ctp-base:     #1e1e2e;
+  --ctp-surface0: #313244;
+  --ctp-surface1: #45475a;
+  --ctp-surface2: #585b70;
+  --ctp-overlay0: #6c7086;
+  --ctp-overlay1: #7f849c;
+  --ctp-overlay2: #9399b2;
+  --ctp-subtext0: #a6adc8;
+  --ctp-subtext1: #bac2de;
+  --ctp-text:     #cdd6f4;
+  --ctp-lavender: #b4befe;
+  --ctp-blue:     #89b4fa;
+  --ctp-sapphire: #74c7ec;
+  --ctp-sky:      #89dceb;
+  --ctp-teal:     #94e2d5;
+  --ctp-green:    #a6e3a1;
+  --ctp-yellow:   #f9e2af;
+  --ctp-peach:    #fab387;
+  --ctp-red:      #f38ba8;
+  --ctp-mauve:    #cba6f7;
+  --piply-font-size: 12px;
+  --piply-font-family: Roboto, "Helvetica Neue", sans-serif;
+}
+
+html, body {
+  height: 100%;
+  margin: 0;
+  font-size: var(--piply-font-size);
+  font-family: var(--piply-font-family);
+  background: var(--ctp-base);
+  color: var(--ctp-text);
+}
+
+// ── Angular Material themes (dark default, light when .light-theme on :root) ──
+$dark-theme: mat.define-theme((
+  color: (
+    theme-type: dark,
+    primary: mat.$blue-palette,
+    tertiary: mat.$violet-palette,
+  ),
+  density: (scale: -1),
+));
+
+$light-theme: mat.define-theme((
+  color: (
+    theme-type: light,
+    primary: mat.$blue-palette,
+    tertiary: mat.$violet-palette,
+  ),
+  density: (scale: -1),
+));
+
+:root {
+  @include mat.all-component-themes($dark-theme);
+}
+
+:root.light-theme {
+  @include mat.all-component-themes($light-theme);
+}
+
+* { box-sizing: border-box; user-select: none; }
+input, textarea, [contenteditable] { user-select: text; }
+
+.mat-mdc-table { width: 100%; }
+.clickable { cursor: pointer; }
+.clickable:hover { background: var(--ctp-surface0) !important; }
+
+// Global path input style
+.path-input {
+  flex: 1;
+  background: var(--ctp-surface0);
+  border: 1px solid var(--ctp-surface1);
+  border-radius: 4px;
+  color: var(--ctp-text);
+  font-size: 12px;
+  font-family: monospace;
+  padding: 3px 8px;
+  outline: none;
+  min-width: 0;
+  &:focus { border-color: var(--ctp-blue); }
+}
+
+// ── mat-menu panel theming ───────────────────────────────────────────────────
+.mat-mdc-menu-panel {
+  background: var(--ctp-mantle) !important;
+  border: 1px solid var(--ctp-surface1) !important;
+  box-shadow: 0 4px 24px rgba(0,0,0,0.5) !important;
+  min-width: 160px !important;
+}
+.mat-mdc-menu-item {
+  height: 32px !important;
+  min-height: 32px !important;
+  padding: 0 12px !important;
+  font-size: 13px !important;
+  color: var(--ctp-text) !important;
+  border-radius: 0 !important;
+}
+.mat-mdc-menu-item .mat-mdc-menu-ripple,
+.mat-mdc-menu-item .mdc-list-item__content,
+.mat-mdc-menu-item::before,
+.mat-mdc-menu-item .mat-mdc-focus-indicator {
+  border-radius: 0 !important;
+}
+.mat-mdc-menu-item .mat-icon {
+  font-size: 16px !important;
+  width: 16px !important;
+  height: 16px !important;
+  margin-right: 8px !important;
+  color: var(--ctp-subtext1) !important;
+}
+.mat-mdc-menu-item:not([disabled]):hover {
+  background: var(--ctp-surface0) !important;
+}
+.mat-mdc-menu-item:not([disabled]):hover .mat-icon {
+  color: var(--ctp-text) !important;
+}
+.mat-mdc-menu-item[disabled] {
+  color: var(--ctp-overlay0) !important;
+}
+.mat-divider {
+  border-top-color: var(--ctp-surface1) !important;
+  margin: 4px 0 !important;
+}
+
+.cdk-overlay-pane.qc-submenu-overlay {
+  z-index: 2000 !important;
+}

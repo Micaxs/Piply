@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Piply</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--ctp-base, #1e1e2e);
+      color: var(--ctp-text, #cdd6f4);
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 16px;
+      user-select: none;
+      -webkit-user-select: none;
+      overflow: hidden;
+    }
+
+    .logo {
+      width: 144px;
+      height: 144px;
+      animation: pop-in 0.4s cubic-bezier(0.34,1.56,0.64,1) both,
+                 bounce 2.4s ease-in-out 0.5s infinite;
+    }
+
+    .app-name {
+      font-size: 28px;
+      font-weight: 700;
+      letter-spacing: 2px;
+      color: var(--ctp-text, #cdd6f4);
+      animation: fade-up 0.4s 0.15s ease both;
+    }
+
+    .version {
+      font-size: 13px;
+      color: var(--ctp-overlay0, #6c7086);
+      letter-spacing: 1px;
+      animation: fade-up 0.4s 0.25s ease both;
+    }
+
+    .spinner-wrap {
+      margin-top: 8px;
+      animation: fade-up 0.4s 0.35s ease both;
+    }
+
+    .spinner {
+      width: 36px;
+      height: 36px;
+      border: 3px solid var(--ctp-surface0, #313244);
+      border-top-color: var(--ctp-blue, #89b4fa);
+      border-right-color: var(--ctp-mauve, #cba6f7);
+      border-radius: 50%;
+      animation: spin 0.75s cubic-bezier(0.4, 0.1, 0.6, 0.9) infinite;
+    }
+
+    @keyframes pop-in {
+      from { opacity: 0; transform: scale(0.7); }
+      to   { opacity: 1; transform: scale(1); }
+    }
+    @keyframes bounce {
+      0%, 100% { transform: translateY(0); }
+      50%       { transform: translateY(-10px); }
+    }
+    @keyframes fade-up {
+      from { opacity: 0; transform: translateY(8px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+  </style>
+  <script>
+    // Apply saved theme before paint to avoid flash
+    (function () {
+      var PRESETS = {
+        'catppuccin-mocha': {'--ctp-crust':'#11111b','--ctp-mantle':'#181825','--ctp-base':'#1e1e2e','--ctp-surface0':'#313244','--ctp-surface1':'#45475a','--ctp-surface2':'#585b70','--ctp-overlay0':'#6c7086','--ctp-overlay1':'#7f849c','--ctp-overlay2':'#9399b2','--ctp-subtext0':'#a6adc8','--ctp-subtext1':'#bac2de','--ctp-text':'#cdd6f4','--ctp-lavender':'#b4befe','--ctp-blue':'#89b4fa','--ctp-sapphire':'#74c7ec','--ctp-sky':'#89dceb','--ctp-teal':'#94e2d5','--ctp-green':'#a6e3a1','--ctp-yellow':'#f9e2af','--ctp-peach':'#fab387','--ctp-red':'#f38ba8','--ctp-mauve':'#cba6f7'},
+        'catppuccin-latte': {'--ctp-crust':'#dce0e8','--ctp-mantle':'#e6e9ef','--ctp-base':'#eff1f5','--ctp-surface0':'#ccd0da','--ctp-surface1':'#bcc0cc','--ctp-surface2':'#acb0be','--ctp-overlay0':'#9ca0b0','--ctp-overlay1':'#8c8fa1','--ctp-overlay2':'#7c7f93','--ctp-subtext0':'#6c6f85','--ctp-subtext1':'#5c5f77','--ctp-text':'#4c4f69','--ctp-lavender':'#7287fd','--ctp-blue':'#1e66f5','--ctp-sapphire':'#209fb5','--ctp-sky':'#04a5e5','--ctp-teal':'#179299','--ctp-green':'#40a02b','--ctp-yellow':'#df8e1d','--ctp-peach':'#fe640b','--ctp-red':'#d20f39','--ctp-mauve':'#8839ef'},
+        'solarized-dark':   {'--ctp-crust':'#00212b','--ctp-mantle':'#002b36','--ctp-base':'#073642','--ctp-surface0':'#0a4555','--ctp-surface1':'#0d5a6e','--ctp-surface2':'#15687e','--ctp-overlay0':'#586e75','--ctp-overlay1':'#657b83','--ctp-overlay2':'#839496','--ctp-subtext0':'#93a1a1','--ctp-subtext1':'#839496','--ctp-text':'#eee8d5','--ctp-lavender':'#6c71c4','--ctp-blue':'#268bd2','--ctp-sapphire':'#2aa198','--ctp-sky':'#2aa198','--ctp-teal':'#2aa198','--ctp-green':'#859900','--ctp-yellow':'#b58900','--ctp-peach':'#cb4b16','--ctp-red':'#dc322f','--ctp-mauve':'#d33682'},
+        'vscode-dark':      {'--ctp-crust':'#1e1e1e','--ctp-mantle':'#252526','--ctp-base':'#1e1e1e','--ctp-surface0':'#2d2d30','--ctp-surface1':'#3e3e42','--ctp-surface2':'#505057','--ctp-overlay0':'#6e6e6e','--ctp-overlay1':'#858585','--ctp-overlay2':'#9d9d9d','--ctp-subtext0':'#bbbbbb','--ctp-subtext1':'#cccccc','--ctp-text':'#d4d4d4','--ctp-lavender':'#c5a5c5','--ctp-blue':'#569cd6','--ctp-sapphire':'#4fc1ff','--ctp-sky':'#9cdcfe','--ctp-teal':'#4ec9b0','--ctp-green':'#6a9955','--ctp-yellow':'#dcdcaa','--ctp-peach':'#ce9178','--ctp-red':'#f44747','--ctp-mauve':'#c586c0'}
+      };
+      try {
+        var raw = localStorage.getItem('piply-settings');
+        if (raw) {
+          var s = JSON.parse(raw);
+          var vars = PRESETS[s.themeId] || null;
+          // Saved custom theme
+          if (!vars && s.savedThemes && s.themeId) {
+            var saved = s.savedThemes.find(function(t) { return t.id === s.themeId; });
+            if (saved) vars = saved.vars;
+          }
+          // Inline custom editor
+          if (!vars && s.themeId === 'custom' && s.customTheme) vars = s.customTheme;
+          if (vars) {
+            var root = document.documentElement;
+            Object.keys(vars).forEach(function(k) { root.style.setProperty(k, vars[k]); });
+          }
+        }
+      } catch (_) {}
+    })();
+  </script>
+</head>
+<body>
+  <img class="logo" src="assets/logo.svg" alt="Piply logo"
+       onerror="this.style.display='none'" />
+  <div class="app-name">Piply</div>
+  <div class="version" id="ver">v0.1.0</div>
+  <div class="spinner-wrap"><div class="spinner"></div></div>
+
+  <script>
+    async function init() {
+      try {
+        const { invoke } = window.__TAURI_INTERNALS__;
+        const version = await invoke('get_version');
+        document.getElementById('ver').textContent = 'v' + version;
+      } catch (_) {}
+
+      setTimeout(async () => {
+        try {
+          const { invoke } = window.__TAURI_INTERNALS__;
+          await invoke('close_splashscreen');
+        } catch (_) {}
+      }, 2000);
+    }
+
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', init);
+    } else {
+      init();
+    }
+  </script>
+</body>
+</html>
+

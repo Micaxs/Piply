@@ -1,0 +1,527 @@
+use anyhow::Result;
+use dirs::config_dir;
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::PathBuf;
+use uuid::Uuid;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Protocol {
+    Ftp,
+    Sftp,
+    Ftps,
+}
+
+/// Nested folder structure for organizing connections
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Folder {
+    pub name: String,
+    #[serde(default)]
+    pub children: Vec<Folder>,
+}
+
+impl Folder {
+    /// Calculate nesting depth
+    fn depth(&self) -> usize {
+        if self.children.is_empty() {
+            1
+        } else {
+            1 + self.children.iter().map(|c| c.depth()).max().unwrap_or(0)
+        }
+    }
+
+    /// Validate folder doesn't exceed max nesting depth (5)
+    fn validate_depth(&self) -> Result<()> {
+        const MAX_DEPTH: usize = 5;
+        if self.depth() > MAX_DEPTH {
+            return Err(anyhow::anyhow!("Folder nesting exceeds maximum depth of {}", MAX_DEPTH));
+        }
+        Ok(())
+    }
+
+    /// Find a folder by path (e.g., ["Folder A", "Folder A-A"])
+    pub fn find_by_path(&self, path: &[String]) -> Option<&Folder> {
+        if path.is_empty() {
+            return Some(self);
+        }
+        if self.name == path[0] {
+            if path.len() == 1 {
+                return Some(self);
+            }
+            return self.children.iter().find_map(|child| child.find_by_path(&path[1..]));
+        }
+        None
+    }
+
+    /// Find a folder mutably by path
+    pub fn find_by_path_mut(&mut self, path: &[String]) -> Option<&mut Folder> {
+        if path.is_empty() {
+            return Some(self);
+        }
+        if self.name == path[0] {
+            if path.len() == 1 {
+                return Some(self);
+            }
+            return self.children.iter_mut().find_map(|child| child.find_by_path_mut(&path[1..]));
+        }
+        None
+    }
+
+    /// List all folders at this level and below (for UI dropdowns)
+    pub fn all_paths(&self, prefix: Vec<String>) -> Vec<Vec<String>> {
+        let mut paths = vec![prefix.clone()];
+        for child in &self.children {
+            let mut child_prefix = prefix.clone();
+            child_prefix.push(child.name.clone());
+            paths.extend(child.all_paths(child_prefix));
+        }
+        paths
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionProfile {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub protocol: Protocol,
+    pub username: String,
+    pub password: String,
+    pub remote_path: String,
+    /// Folder path as array (e.g., ["Folder A", "Folder A-A"])
+    /// Empty array means root level ("Servers")
+    #[serde(default)]
+    pub folder: Vec<String>,
+    #[serde(default)]
+    pub key_id: Option<String>,
+}
+
+/// Container for connections and folder metadata (stored together in encrypted database)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionsData {
+    #[serde(default)]
+    pub connections: Vec<ConnectionProfile>,
+    /// Nested folder structure
+    #[serde(default)]
+    pub folders: Vec<Folder>,
+}
+
+impl ConnectionProfile {
+    #[allow(dead_code)]
+    pub fn default_port(protocol: &Protocol) -> u16 {
+        match protocol {
+            Protocol::Ftp => 21,
+            Protocol::Sftp => 22,
+            Protocol::Ftps => 21,
+        }
+    }
+}
+
+fn config_path() -> PathBuf {
+    let mut path = config_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("filie");
+    path.push("connections.json");
+    path
+}
+
+pub fn load_connections() -> Result<Vec<ConnectionProfile>> {
+    let path = config_path();
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let data = fs::read_to_string(&path)?;
+    
+    // Try new format first (with nested folders)
+    if let Ok(wrapper) = serde_json::from_str::<ConnectionsData>(&data) {
+        return Ok(wrapper.connections);
+    }
+    
+    // Fallback to old format (array only) for backward compatibility
+    let connections: Vec<ConnectionProfile> = serde_json::from_str(&data)?;
+    Ok(connections)
+}
+
+/// Load all data (connections and folders) from encrypted storage
+/// Handles migration from old flat format to new nested format
+fn load_all_from_encrypted() -> Result<ConnectionsData> {
+    let key = crate::encryption::EncryptionManager::get_or_create_key()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let file_path = crate::encryption::EncryptionManager::get_connections_file_path()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    if !file_path.exists() {
+        // Check for old plaintext connections.json and migrate
+        let old_path = config_path();
+        if old_path.exists() {
+            // Migrate from old plaintext file
+            let content = fs::read_to_string(&old_path)?;
+            
+            // Try to parse as new format (with folders)
+            if let Ok(data) = serde_json::from_str::<ConnectionsData>(&content) {
+                // Already in new nested format, just ensure connections use array paths
+                return Ok(ConnectionsData {
+                    connections: migrate_connection_folders_to_paths(data.connections),
+                    folders: data.folders,
+                });
+            }
+            
+            // Try old format with flat folders
+            if let Ok(old_data) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(folders_arr) = old_data.get("folders").and_then(|v| v.as_array()) {
+                    // Convert old flat folders to nested structure
+                    let mut flat_folders: Vec<String> = vec![];
+                    for folder in folders_arr {
+                        if let Some(name) = folder.as_str() {
+                            flat_folders.push(name.to_string());
+                        }
+                    }
+                    let nested_folders = convert_flat_to_nested(flat_folders);
+                    
+                    let connections = if let Some(conns) = old_data.get("connections").and_then(|v| v.as_array()) {
+                        serde_json::from_value::<Vec<ConnectionProfile>>(serde_json::Value::Array(conns.clone()))?
+                    } else {
+                        Vec::new()
+                    };
+                    
+                    return Ok(ConnectionsData {
+                        connections: migrate_connection_folders_to_paths(connections),
+                        folders: nested_folders,
+                    });
+                }
+            }
+            
+            // Last resort: just parse as array of connections
+            let connections: Vec<ConnectionProfile> = serde_json::from_str(&content)?;
+            return Ok(ConnectionsData {
+                connections: migrate_connection_folders_to_paths(connections),
+                folders: Vec::new(),
+            });
+        }
+        return Ok(ConnectionsData {
+            connections: Vec::new(),
+            folders: Vec::new(),
+        });
+    }
+
+    // Load from encrypted file
+    let encrypted_data = fs::read(&file_path)?;
+    let decrypted_data = crate::encryption::EncryptionManager::decrypt(&key, &encrypted_data)
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let data: ConnectionsData = serde_json::from_slice(&decrypted_data)?;
+
+    Ok(data)
+}
+
+/// Load connections only (backward compatibility)
+fn load_connections_from_encrypted() -> Result<Vec<ConnectionProfile>> {
+    let data = load_all_from_encrypted()?;
+    Ok(data.connections)
+}
+
+/// Convert old flat folder list to nested structure (all at root level)
+fn convert_flat_to_nested(flat_folders: Vec<String>) -> Vec<Folder> {
+    flat_folders
+        .into_iter()
+        .map(|name| Folder {
+            name,
+            children: Vec::new(),
+        })
+        .collect()
+}
+
+/// Migrate old string folder field to new array path field
+fn migrate_connection_folders_to_paths(mut connections: Vec<ConnectionProfile>) -> Vec<ConnectionProfile> {
+    for conn in &mut connections {
+        // If folder is already an array (new format), it's fine
+        // The serde default handles conversion from "" string to [] array
+        if conn.folder.is_empty() && !conn.folder.is_empty() {
+            // This shouldn't happen with our serde defaults, but just in case
+            conn.folder = Vec::new();
+        }
+    }
+    connections
+}
+
+#[allow(dead_code)]
+fn save_all(connections: &[ConnectionProfile]) -> Result<()> {
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    // Load existing folders to preserve them
+    let folders = load_folders().unwrap_or_default();
+    let data = ConnectionsData {
+        connections: connections.to_vec(),
+        folders,
+    };
+    let json = serde_json::to_string_pretty(&data)?;
+    fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Save connection with encryption (async version for use in commands)
+pub async fn save_connection_encrypted(mut profile: ConnectionProfile) -> Result<ConnectionProfile> {
+    let key = crate::encryption::EncryptionManager::get_or_create_key()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let file_path = crate::encryption::EncryptionManager::get_connections_file_path()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Load existing connections from encrypted storage (with plaintext fallback for migration)
+    let mut connections = load_connections_from_encrypted()?;
+    
+    // Generate ID if new
+    if profile.id.is_empty() {
+        profile.id = Uuid::new_v4().to_string();
+        connections.push(profile.clone());
+    } else {
+        // Update or add
+        let pos = connections.iter().position(|c| c.id == profile.id);
+        if let Some(i) = pos {
+            connections[i] = profile.clone();
+        } else {
+            connections.push(profile.clone());
+        }
+    }
+
+    // Load folders to preserve them
+    let folders = load_folders().unwrap_or_default();
+    let data = ConnectionsData { connections, folders };
+
+    // Ensure config directory exists
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let json_data = serde_json::to_vec(&data.connections)?;
+
+    let encrypted_data = crate::encryption::EncryptionManager::encrypt(&key, &json_data)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    fs::write(&file_path, encrypted_data)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&file_path, permissions)?;
+    }
+
+    Ok(profile)
+}
+
+/// Delete connection with encryption (async version for use in commands)
+pub async fn delete_connection_encrypted(id: &str) -> Result<()> {
+    let key = crate::encryption::EncryptionManager::get_or_create_key()
+        .map_err(|e| anyhow::anyhow!(e))?;
+    let file_path = crate::encryption::EncryptionManager::get_connections_file_path()
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    // Load all data (connections and folders) from encrypted storage
+    let mut data = load_all_from_encrypted()?;
+    data.connections.retain(|c| c.id != id);
+
+    if let Some(parent) = file_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let json_data = serde_json::to_vec(&data.connections)?;
+
+    let encrypted_data = crate::encryption::EncryptionManager::encrypt(&key, &json_data)
+        .map_err(|e| anyhow::anyhow!(e))?;
+
+    fs::write(&file_path, encrypted_data)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let permissions = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(&file_path, permissions)?;
+    }
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub fn save_connection(mut profile: ConnectionProfile) -> Result<ConnectionProfile> {
+    let mut connections = load_connections()?;
+    if profile.id.is_empty() {
+        profile.id = Uuid::new_v4().to_string();
+        connections.push(profile.clone());
+    } else {
+        let pos = connections.iter().position(|c| c.id == profile.id);
+        if let Some(i) = pos {
+            connections[i] = profile.clone();
+        } else {
+            connections.push(profile.clone());
+        }
+    }
+    save_all(&connections)?;
+    Ok(profile)
+}
+
+#[allow(dead_code)]
+pub fn delete_connection(id: &str) -> Result<()> {
+    let mut connections = load_connections()?;
+    connections.retain(|c| c.id != id);
+    save_all(&connections)?;
+    Ok(())
+}
+
+/// Load folders from encrypted storage
+pub fn load_folders() -> Result<Vec<Folder>> {
+    let path = config_path();
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let data = fs::read_to_string(&path)?;
+    let data: ConnectionsData = serde_json::from_str(&data).unwrap_or_else(|_| {
+        // Fallback: if file contains old format (just array), treat as connections only
+        ConnectionsData {
+            connections: serde_json::from_str(&data).unwrap_or_default(),
+            folders: vec![],
+        }
+    });
+    Ok(data.folders)
+}
+
+/// Load folders as flat list of paths (for backwards compatibility with commands)
+pub fn load_folders_flat() -> Result<Vec<Vec<String>>> {
+    let folders = load_folders()?;
+    let mut paths = Vec::new();
+    for folder in folders {
+        paths.extend(folder.all_paths(vec![folder.name.clone()]));
+    }
+    Ok(paths)
+}
+
+/// Save folders to plaintext storage
+#[allow(dead_code)]
+pub fn save_folders(folders: &[Folder]) -> Result<()> {
+    let connections = load_connections()?;
+    let data = ConnectionsData {
+        connections,
+        folders: folders.to_vec(),
+    };
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let json = serde_json::to_string_pretty(&data)?;
+    fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Add a folder at root level or nested
+/// path is the parent folder path (empty = root), name is the new folder name
+pub fn add_folder(path: &[String], name: &str) -> Result<Vec<Folder>> {
+    let mut folders = load_folders()?;
+    
+    // Validate nesting depth
+    let max_depth = if path.is_empty() { 0 } else { path.len() };
+    if max_depth + 1 > 5 {
+        return Err(anyhow::anyhow!("Cannot nest folders deeper than 5 levels"));
+    }
+    
+    let new_folder = Folder {
+        name: name.to_string(),
+        children: Vec::new(),
+    };
+    
+    if path.is_empty() {
+        // Add to root
+        folders.push(new_folder);
+    } else {
+        // Find parent and add to it
+        if let Some(parent) = find_folder_mut(&mut folders, path) {
+            parent.children.push(new_folder);
+        }
+    }
+    
+    // Save back to plaintext storage
+    save_folders(&folders)?;
+    
+    Ok(folders)
+}
+
+/// Remove a folder from the nested structure
+pub fn remove_folder(path: &[String]) -> Result<Vec<Folder>> {
+    let mut folders = load_folders()?;
+    
+    if path.is_empty() {
+        return Err(anyhow::anyhow!("Cannot remove root folder"));
+    }
+    
+    // Navigate to parent and remove the folder
+    let parent_path = &path[..path.len() - 1];
+    let folder_name = &path[path.len() - 1];
+    
+    if parent_path.is_empty() {
+        // Remove from root
+        folders.retain(|f| f.name != *folder_name);
+    } else {
+        // Find parent and remove from it
+        if let Some(parent) = find_folder_mut(&mut folders, parent_path) {
+            parent.children.retain(|f| f.name != *folder_name);
+        }
+    }
+    
+    // Save back
+    save_folders(&folders)?;
+    Ok(folders)
+}
+
+/// Rename a folder  
+pub fn rename_folder(path: &[String], new_name: &str) -> Result<Vec<Folder>> {
+    let mut folders = load_folders()?;
+    
+    if path.is_empty() {
+        return Err(anyhow::anyhow!("Cannot rename root folder"));
+    }
+    
+    // Navigate to folder and rename it
+    if let Some(folder) = find_folder_mut(&mut folders, path) {
+        folder.name = new_name.to_string();
+    } else {
+        return Err(anyhow::anyhow!("Folder not found"));
+    }
+    
+    // Save back
+    save_folders(&folders)?;
+    Ok(folders)
+}
+
+fn find_folder(folders: &[Folder], path: &[String]) -> Option<&Folder> {
+    if path.is_empty() {
+        return None;
+    }
+    for folder in folders {
+        if folder.name == path[0] {
+            if path.len() == 1 {
+                return Some(folder);
+            }
+            return find_folder(&folder.children, &path[1..]);
+        }
+    }
+    None
+}
+
+fn find_folder_mut(folders: &mut [Folder], path: &[String]) -> Option<&mut Folder> {
+    if path.is_empty() {
+        return None;
+    }
+    for folder in folders {
+        if folder.name == path[0] {
+            if path.len() == 1 {
+                return Some(folder);
+            }
+            return find_folder_mut(&mut folder.children, &path[1..]);
+        }
+    }
+    None
+}
+
