@@ -1,5 +1,6 @@
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use uuid::Uuid;
@@ -32,20 +33,24 @@ pub struct TransferItem {
     pub bytes_transferred: u64,
     pub total_bytes: u64,
     pub error: Option<String>,
+    /// Monotonically increasing insertion order — used for stable queue ordering.
+    pub order: u64,
 }
 
 pub struct TransferManager {
     semaphore: Arc<Semaphore>,
     pub transfers: Arc<DashMap<String, TransferItem>>,
+    next_order: Arc<AtomicU64>,
 }
 
-const MAX_CONCURRENT: usize = 10;
+pub const MAX_CONCURRENT: usize = 10;
 
 impl TransferManager {
     pub fn new() -> Self {
         Self {
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT)),
             transfers: Arc::new(DashMap::new()),
+            next_order: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -61,6 +66,7 @@ impl TransferManager {
         direction: TransferDirection,
         total_bytes: u64,
     ) -> TransferItem {
+        let order = self.next_order.fetch_add(1, Ordering::Relaxed);
         TransferItem {
             id: Uuid::new_v4().to_string(),
             session_id,
@@ -71,6 +77,7 @@ impl TransferManager {
             bytes_transferred: 0,
             total_bytes,
             error: None,
+            order,
         }
     }
 
@@ -152,7 +159,9 @@ impl TransferManager {
     }
 
     pub fn get_all(&self) -> Vec<TransferItem> {
-        self.transfers.iter().map(|r| r.value().clone()).collect()
+        let mut items: Vec<TransferItem> = self.transfers.iter().map(|r| r.value().clone()).collect();
+        items.sort_by_key(|t| t.order);
+        items
     }
 
     pub fn get_semaphore(&self) -> Arc<Semaphore> {

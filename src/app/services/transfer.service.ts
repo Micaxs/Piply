@@ -18,6 +18,8 @@ export interface TransferItem {
   bytesTransferred: number;
   totalBytes: number;
   error: string | null;
+  /** Monotonically increasing insertion index — used for stable queue ordering. */
+  order: number;
 }
 
 export interface TransferProgressEvent {
@@ -34,7 +36,15 @@ const TERMINAL: ReadonlySet<TransferStatus> = new Set(['Done', 'Failed', 'Cancel
 export class TransferService {
   readonly transfers = signal<TransferItem[]>([]);
   private unlistenFn: UnlistenFn | null = null;
-  private pollTimer: ReturnType<typeof setInterval> | null = null;
+  private pollTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /** Returns poll delay (ms) based on how many transfers are actively changing. */
+  private nextPollDelay(): number {
+    const active = this.transfers().filter(t => ACTIVE.has(t.status)).length;
+    if (active > 500) return 2000;
+    if (active > 100) return 750;
+    return 300;
+  }
 
   private priorityMap = new Map<string, TransferPriority>();
   readonly priorityOrder: Record<TransferPriority, number> = { high: 0, medium: 1, low: 2 };
@@ -87,19 +97,24 @@ export class TransferService {
     this.stopPolling();
   }
 
-  /** Poll Rust every 300 ms while transfers are active; stops automatically. */
+  /** Poll Rust at an adaptive rate while transfers are active; stops automatically. */
   private startPolling(): void {
-    if (this.pollTimer) return;
-    this.pollTimer = setInterval(async () => {
+    if (this.pollTimer !== null) return;
+    const schedule = async () => {
       await this.refreshTransfers();
       const hasActive = this.transfers().some(t => ACTIVE.has(t.status));
-      if (!hasActive) this.stopPolling();
-    }, 300);
+      if (hasActive) {
+        this.pollTimer = setTimeout(schedule, this.nextPollDelay());
+      } else {
+        this.pollTimer = null;
+      }
+    };
+    this.pollTimer = setTimeout(schedule, this.nextPollDelay());
   }
 
   private stopPolling(): void {
-    if (this.pollTimer) {
-      clearInterval(this.pollTimer);
+    if (this.pollTimer !== null) {
+      clearTimeout(this.pollTimer);
       this.pollTimer = null;
     }
   }

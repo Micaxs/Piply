@@ -6,7 +6,7 @@ use tokio::time::{timeout, Duration};
 use crate::connection_store::{self, ConnectionProfile, Protocol};
 use crate::ftp_client::{FtpClientManager, RemoteEntry};
 use crate::sftp_client::SftpClientManager;
-use crate::transfer_manager::{TransferDirection, TransferItem, TransferManager, TransferStatus};
+use crate::transfer_manager::{TransferDirection, TransferItem, TransferManager, TransferStatus, MAX_CONCURRENT};
 use crate::ssh_key_store;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -220,43 +220,59 @@ pub async fn list_remote(
 
 // ─── Transfer commands ──────────────────────────────────────────────────────
 
-#[tauri::command]
-pub async fn upload(
+/// Recursively collect all subdirectory and file paths under `dir`.
+/// `dirs`  receives (local_abs_path, remote_relative_path) for each subdir.
+/// `files` receives (local_abs_path, remote_relative_path, size_bytes).
+fn collect_dir_entries(
+    root: &std::path::Path,
+    current: &std::path::Path,
+    dirs: &mut Vec<(String, String)>,
+    files: &mut Vec<(String, String, u64)>,
+) -> std::io::Result<()> {
+    for entry in fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let meta = fs::metadata(&path)?;
+
+        let rel = path.strip_prefix(root).unwrap();
+        // Always use forward-slashes for the remote side.
+        let rel_remote = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let local_str = path.to_string_lossy().into_owned();
+
+        if meta.is_dir() {
+            dirs.push((local_str.clone(), rel_remote.clone()));
+            collect_dir_entries(root, &path, dirs, files)?;
+        } else {
+            files.push((local_str, rel_remote, meta.len()));
+        }
+    }
+    Ok(())
+}
+
+/// Spawn the upload task for an **already-enqueued** transfer item.
+/// The semaphore limits concurrency to MAX_CONCURRENT; tasks acquire permits
+/// in spawn order so the queue processes top-to-bottom.
+fn dispatch_upload_task(
+    tid: String,
     session_id: String,
     protocol: Protocol,
     local_path: String,
     remote_path: String,
+    file_size: u64,
     app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
-    let file_size = fs::metadata(&local_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
-
-    let item = state.transfers.new_transfer(
-        session_id.clone(),
-        local_path.clone(),
-        remote_path.clone(),
-        TransferDirection::Upload,
-        file_size,
-    );
-    let transfer_id = item.id.clone();
-    state.transfers.enqueue(item);
-
-    emit_activity(&app, "info", &format!("Upload queued: {}", local_path));
-
-    let transfers = state.transfers.clone();
-    let ftp = state.ftp.clone();
-    let sftp = state.sftp.clone();
-    let sem = state.transfers.get_semaphore();
-    let tid = transfer_id.clone();
-
+    transfers: Arc<TransferManager>,
+    ftp: Arc<FtpClientManager>,
+    sftp: Arc<SftpClientManager>,
+    sem: Arc<tokio::sync::Semaphore>,
+) {
     tokio::spawn(async move {
         let _permit = sem.acquire().await.unwrap();
 
-        if transfers.is_cancelled(&tid) {
-            return;
-        }
+        if transfers.is_cancelled(&tid) { return; }
 
         transfers.update_status(&tid, TransferStatus::InProgress);
         emit_progress(&app, &transfers, &tid);
@@ -288,15 +304,193 @@ pub async fn upload(
                     .unwrap_or(file_size);
                 transfers.complete(&tid, actual.max(file_size));
             }
-            Err(_) if transfers.is_cancelled(&tid) => { /* already Cancelled */ }
-            Err(e) => {
-                transfers.set_error(&tid, e.to_string());
-            }
+            Err(_) if transfers.is_cancelled(&tid) => {}
+            Err(e) => { transfers.set_error(&tid, e.to_string()); }
         }
         emit_progress(&app, &transfers, &tid);
     });
+}
 
-    Ok(transfer_id)
+/// Enqueue a new single-file transfer item and immediately dispatch its task.
+fn spawn_file_upload(
+    session_id: String,
+    protocol: Protocol,
+    local_path: String,
+    remote_path: String,
+    file_size: u64,
+    app: AppHandle,
+    transfers: Arc<TransferManager>,
+    ftp: Arc<FtpClientManager>,
+    sftp: Arc<SftpClientManager>,
+    sem: Arc<tokio::sync::Semaphore>,
+) -> String {
+    let item = transfers.new_transfer(
+        session_id.clone(),
+        local_path.clone(),
+        remote_path.clone(),
+        TransferDirection::Upload,
+        file_size,
+    );
+    let tid = item.id.clone();
+    transfers.enqueue(item);
+    dispatch_upload_task(tid.clone(), session_id, protocol, local_path, remote_path, file_size, app, transfers, ftp, sftp, sem);
+    tid
+}
+
+#[tauri::command]
+pub async fn upload(
+    session_id: String,
+    protocol: Protocol,
+    local_path: String,
+    remote_path: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let meta = fs::metadata(&local_path).map_err(|e| e.to_string())?;
+
+    let transfers = state.transfers.clone();
+    let ftp = state.ftp.clone();
+    let sftp = state.sftp.clone();
+    let sem = state.transfers.get_semaphore();
+
+    if meta.is_dir() {
+        // ── 1. Collect all local entries (fast, no network) ──────────────
+        let mut dir_entries: Vec<(String, String)> = Vec::new();
+        let mut file_entries: Vec<(String, String, u64)> = Vec::new();
+        collect_dir_entries(
+            std::path::Path::new(&local_path),
+            std::path::Path::new(&local_path),
+            &mut dir_entries,
+            &mut file_entries,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Sort dirs shallow-first so parents are created before children.
+        dir_entries.sort_by_key(|(_, rel)| rel.matches('/').count());
+
+        // ── 2. Enqueue ALL file items immediately so they appear in the UI ─
+        let mut queued: Vec<(String, String, String, u64)> = Vec::new(); // (tid, local, remote, size)
+        let mut first_id = String::new();
+        for (local_file, rel_remote, size) in &file_entries {
+            let remote_file = format!("{}/{}", remote_path, rel_remote);
+            let item = transfers.new_transfer(
+                session_id.clone(),
+                local_file.clone(),
+                remote_file.clone(),
+                TransferDirection::Upload,
+                *size,
+            );
+            let tid = item.id.clone();
+            if first_id.is_empty() { first_id = tid.clone(); }
+            transfers.enqueue(item);
+            queued.push((tid, local_file.clone(), remote_file, *size));
+        }
+
+        emit_activity(
+            &app,
+            "info",
+            &format!("Upload queued: {} ({} files)", local_path, file_entries.len()),
+        );
+
+        // ── 3. Background coordinator: mkdirs then dispatch uploads ───────
+        tokio::spawn(async move {
+            // Create the root remote directory.
+            let _ = match &protocol {
+                Protocol::Ftp | Protocol::Ftps => ftp.mkdir(&session_id, &remote_path).await,
+                Protocol::Sftp => sftp.mkdir(&session_id, &remote_path).await,
+            };
+
+            // Create each remote subdirectory.
+            for (_, rel_remote) in &dir_entries {
+                let remote_dir = format!("{}/{}", remote_path, rel_remote);
+                let _ = match &protocol {
+                    Protocol::Ftp | Protocol::Ftps => ftp.mkdir(&session_id, &remote_dir).await,
+                    Protocol::Sftp => sftp.mkdir(&session_id, &remote_dir).await,
+                };
+            }
+
+            // Use a JoinSet capped at MAX_CONCURRENT so we never have more than
+            // MAX_CONCURRENT live upload futures — avoids spawning thousands of
+            // waiting tasks that would bloat the tokio scheduler.
+            let mut active: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
+
+            for (tid, local_file, remote_file, size) in queued {
+                // Drain one completed slot before adding a new one.
+                if active.len() >= MAX_CONCURRENT {
+                    active.join_next().await;
+                }
+
+                if transfers.is_cancelled(&tid) { continue; }
+
+                let transfers2 = transfers.clone();
+                let ftp2 = ftp.clone();
+                let sftp2 = sftp.clone();
+                let app2 = app.clone();
+                let session_id2 = session_id.clone();
+                let protocol2 = protocol.clone();
+
+                active.spawn(async move {
+                    if transfers2.is_cancelled(&tid) { return; }
+
+                    transfers2.update_status(&tid, TransferStatus::InProgress);
+                    emit_progress(&app2, &transfers2, &tid);
+
+                    let app3 = app2.clone();
+                    let t2 = transfers2.clone();
+                    let tid2 = tid.clone();
+                    let cb = move |bytes: u64, total: u64| -> bool {
+                        loop {
+                            if t2.is_cancelled(&tid2) { return false; }
+                            if !t2.is_paused(&tid2) { break; }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        if t2.is_cancelled(&tid2) { return false; }
+                        t2.update_bytes(&tid2, bytes, total);
+                        emit_progress(&app3, &t2, &tid2);
+                        !t2.is_cancelled(&tid2)
+                    };
+
+                    let result = match protocol2 {
+                        Protocol::Ftp | Protocol::Ftps => ftp2.upload(&session_id2, &local_file, &remote_file, cb).await,
+                        Protocol::Sftp => sftp2.upload(&session_id2, &local_file, &remote_file, cb).await,
+                    };
+
+                    match result {
+                        Ok(()) => {
+                            let actual = transfers2.transfers.get(&tid)
+                                .map(|t| t.bytes_transferred)
+                                .unwrap_or(size);
+                            transfers2.complete(&tid, actual.max(size));
+                        }
+                        Err(_) if transfers2.is_cancelled(&tid) => {}
+                        Err(e) => { transfers2.set_error(&tid, e.to_string()); }
+                    }
+                    emit_progress(&app2, &transfers2, &tid);
+                });
+            }
+
+            // Wait for remaining in-flight uploads to finish.
+            while active.join_next().await.is_some() {}
+        });
+
+        Ok(if first_id.is_empty() { Uuid::new_v4().to_string() } else { first_id })
+    } else {
+        // Single-file upload.
+        let file_size = meta.len();
+        emit_activity(&app, "info", &format!("Upload queued: {}", local_path));
+        Ok(spawn_file_upload(
+            session_id,
+            protocol,
+            local_path,
+            remote_path,
+            file_size,
+            app,
+            transfers,
+            ftp,
+            sftp,
+            sem,
+        ))
+    }
 }
 
 #[tauri::command]

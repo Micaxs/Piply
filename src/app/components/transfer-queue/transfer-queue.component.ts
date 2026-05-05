@@ -6,6 +6,7 @@ import { MatProgressBarModule } from '@angular/material/progress-bar';
 import { MatTooltipModule } from '@angular/material/tooltip';
 import { MatTabsModule } from '@angular/material/tabs';
 import { MatMenuModule, MatMenuTrigger } from '@angular/material/menu';
+import { ScrollingModule } from '@angular/cdk/scrolling';
 import { TransferService, TransferItem, TransferPriority } from '../../services/transfer.service';
 import { TransferHistoryService, HistoryEntry } from '../../services/transfer-history.service';
 
@@ -16,6 +17,7 @@ import { TransferHistoryService, HistoryEntry } from '../../services/transfer-hi
     NgTemplateOutlet, TitleCasePipe,
     MatIconModule, MatButtonModule,
     MatProgressBarModule, MatTooltipModule, MatTabsModule, MatMenuModule,
+    ScrollingModule,
   ],
   template: `
     <div class="queue-panel">
@@ -85,8 +87,8 @@ import { TransferHistoryService, HistoryEntry } from '../../services/transfer-hi
               @if (historySvc.entries().length === 0) {
                 <p class="empty-hint">No transfer history yet.</p>
               }
-              @for (h of historySvc.entries(); track h.id) {
-                <div class="tbl-row">
+              <cdk-virtual-scroll-viewport itemSize="30" class="vscroll">
+                <div *cdkVirtualFor="let h of historySvc.entries(); trackBy: trackHistoryId" class="tbl-row">
                   <span class="col col-name" [matTooltip]="h.direction === 'Upload' ? h.localPath : h.remotePath">
                     {{ h.fileName }}
                   </span>
@@ -102,7 +104,7 @@ import { TransferHistoryService, HistoryEntry } from '../../services/transfer-hi
                   </span>
                   <span class="col col-act"></span>
                 </div>
-              }
+              </cdk-virtual-scroll-viewport>
             </div>
           </div>
         </mat-tab>
@@ -153,8 +155,8 @@ import { TransferHistoryService, HistoryEntry } from '../../services/transfer-hi
               @else { No failed transfers. }
             </p>
           }
-          @for (t of rows; track t.id) {
-            <div class="tbl-row"
+          <cdk-virtual-scroll-viewport itemSize="30" class="vscroll">
+            <div *cdkVirtualFor="let t of rows; trackBy: trackById" class="tbl-row"
               [class.inprogress]="t.status === 'InProgress'"
               [class.paused]="t.status === 'Paused'"
               (contextmenu)="onRowCtx($event, t.id)">
@@ -277,7 +279,7 @@ import { TransferHistoryService, HistoryEntry } from '../../services/transfer-hi
                 }
               </span>
             </div>
-          }
+          </cdk-virtual-scroll-viewport>
         </div>
       </div>
     </ng-template>
@@ -335,7 +337,9 @@ import { TransferHistoryService, HistoryEntry } from '../../services/transfer-hi
     .tbl-head .col { display: flex; align-items: center; }
     .hd-left   { justify-content: flex-start; }
     .hd-center { justify-content: center; }
-    .tbl-body  { flex: 1; overflow-y: auto; overflow-x: hidden; }
+    .tbl-body  { flex: 1; min-height: 0; overflow: hidden; }
+    .vscroll   { height: 100%; }
+    ::ng-deep .vscroll .cdk-virtual-scroll-content-wrapper { width: 100%; }
 
     /* Columns */
     .col-name { width: var(--col-name, 220px); min-width: 80px;  flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 0 8px; }
@@ -449,13 +453,22 @@ export class TransferQueueComponent {
   private boundMouseMove = this.onMouseMove.bind(this);
   private boundMouseUp   = this.onMouseUp.bind(this);
 
-  queued = computed(() =>
-    this.svc.transfers()
+  queued = computed(() => {
+    const statusRank: Record<string, number> = { InProgress: 0, Paused: 1, Queued: 2 };
+    return this.svc.transfers()
       .filter(t => t.status === 'Queued' || t.status === 'InProgress' || t.status === 'Paused')
-      .sort((a, b) => this.svc.comparePriority(a.id, b.id))
-  );
-  successful() { return this.svc.transfers().filter(t => t.status === 'Done'); }
-  failed()     { return this.svc.transfers().filter(t => t.status === 'Failed' || t.status === 'Cancelled'); }
+      .sort((a, b) => {
+        const byStatus = (statusRank[a.status] ?? 3) - (statusRank[b.status] ?? 3);
+        if (byStatus !== 0) return byStatus;
+        const byPriority = this.svc.comparePriority(a.id, b.id);
+        return byPriority !== 0 ? byPriority : a.order - b.order;
+      });
+  });
+  successful = computed(() => this.svc.transfers().filter(t => t.status === 'Done'));
+  failed     = computed(() => this.svc.transfers().filter(t => t.status === 'Failed' || t.status === 'Cancelled'));
+
+  trackById(_: number, t: TransferItem): string { return t.id; }
+  trackHistoryId(_: number, h: HistoryEntry): string { return h.id; }
 
   onRowCtx(event: MouseEvent, transferId: string) {
     event.preventDefault();
